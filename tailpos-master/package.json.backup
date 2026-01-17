@@ -22,23 +22,15 @@
   "scripts": {
     "postinstall": "remotedev-debugger",
     "start": "react-native start",
-    "start:reset": "react-native start --reset-cache",
     "android": "yarn change && react-native run-android",
     "ios": "react-native run-ios",
     "jest": "node node_modules/jest/bin/jest.js --no-cache --maxWorkers=2",
     "test": "yarn run prettier && eslint src/**",
-    "test:api": "node scripts/check-dependencies.js && node src/api/TestConnection.js",
     "lint": "eslint src/**",
     "fixcode": "eslint --fix src/**",
     "prettier": "prettier --trailing-comma all --write \"src/**/*.js\"",
     "clean": "rm -rf $TMPDIR/react-* && rm -rf node_modules/",
-    "clean:cache": "rm -rf $TMPDIR/react-* && rm -rf $TMPDIR/metro-* && watchman watch-del-all",
-    "reinstall": "rm -rf node_modules && npm install",
     "apk": "cd android && ./gradlew assembleRelease && cd ..",
-    "android:clean": "cd android && ./gradlew clean && cd ..",
-    "android:build": "cd android && ./gradlew assembleRelease && cd ..",
-    "check:deps": "node scripts/check-dependencies.js",
-    "sync:test": "node scripts/test-sync.js",
     "change": "cp changes/nfc-manager-build.gradle node_modules/react-native-nfc-manager/android/build.gradle && cp changes/localization-build.gradle node_modules/react-native-localization/android/build.gradle && cp changes/deviceinfo-build.gradle node_modules/react-native-device-info/android/build.gradle && cp changes/camera-build.gradle node_modules/react-native-camera/android/build.gradle && cp changes/maps-build.gradle node_modules/react-native-maps/lib/android/build.gradle && cp changes/RCTBluetoothSerialPackage.java node_modules/react-native-bluetooth-serial/android/src/main/java/com/rusel/RCTBluetoothSerial/"
   },
   "jest": {

@@ -1,18 +1,3 @@
-/**
- * syncInBackground.js
- *
- * Gestion de la synchronisation en arriere-plan et des mises a jour de donnees.
- *
- * MODIFICATION Phase 3: Integration avec la nouvelle couche API
- * - Utilisation de SyncService au lieu des appels directs a tailpos_sync
- * - Conservation de la compatibilite avec les anciennes fonctions
- * - Ajout de gestion d'erreurs amelioree
- *
- * @author TailPOS Integration
- * @version 2.0.0
- * @date 2025-01-17
- */
-
 import { Toast } from "native-base";
 import { currentLanguage } from "../../translations/CurrentLanguage";
 import translation from "../../translations/translation";
@@ -20,239 +5,107 @@ import LocalizedStrings from "react-native-localization";
 let strings = new LocalizedStrings(translation);
 import BackgroundJob from "react-native-background-job";
 
-// ============================================================================
-// NOUVEAU: Import de la nouvelle couche API (Phase 3)
-// ============================================================================
-import { SyncService, ApiConfig, SYNC_STATUS, FrappeAPI } from "../../api";
-
-// ============================================================================
-// FONCTION PRINCIPALE DE SYNCHRONISATION
-// ============================================================================
-
-/**
- * MODIFIE Phase 3: Fonction principale de synchronisation
- * Cette fonction est appelee soit manuellement soit par le BackgroundJob
- *
- * @param {string} status - Type de sync ("forceSync" ou "sync")
- * @param {Object} store - Reference au store MobX principal
- * @param {boolean} jobStatus - True si appele depuis un BackgroundJob
- * @returns {Promise<Object>} Resultat de la synchronisation
- */
-export async function syncObjectValues(status, store, jobStatus) {
-  // Configurer la langue
+export function syncObjectValues(status, store, jobStatus) {
   strings.setLanguage(currentLanguage().companyLanguage);
+  store.itemStore.resetLengths();
+  const { forceSync, selectedSync } = store.syncStore;
 
-  console.log("[syncInBackground] Demarrage sync, status:", status, "jobStatus:", jobStatus);
+  let syncStoreMethod = "";
 
-  try {
-    // Reinitialiser les compteurs d'items
-    if (store && store.itemStore) {
-      store.itemStore.resetLengths();
-    }
+  if (status === "forceSync") {
+    syncStoreMethod = forceSync();
+  }
 
-    // NOUVEAU: Verifier si la configuration API existe
-    const config = await ApiConfig.loadConfig();
-    if (!config || !ApiConfig.isFullyConfigured()) {
-      console.log("[syncInBackground] Configuration API non complete, sync ignoree");
+  if (status === "sync") {
+    syncStoreMethod = selectedSync();
+  }
 
-      if (!jobStatus) {
-        Toast.show({
-          text: strings.ConfigureSync || "Configurez la connexion ERPNext dans les parametres",
-          type: "warning",
-          duration: 5000,
+  syncStoreMethod.then(async result => {
+    const resLength = JSON.parse(result).length;
+    const trashLength = JSON.parse(store.syncStore.trashRows).length;
+    if (resLength > 0 || trashLength > 0) {
+      const protocol = store.stateStore.isHttps ? "https://" : "http://";
+
+      const syncInfo = {
+        deviceId: store.stateStore.deviceId,
+        url:
+          store.printerStore.sync[0].url !== undefined
+            ? protocol + store.printerStore.sync[0].url
+            : "",
+        user_name: store.printerStore.sync[0].user_name
+          ? store.printerStore.sync[0].user_name
+          : "",
+        password: store.printerStore.sync[0].password
+          ? store.printerStore.sync[0].password
+          : "",
+      };
+
+      store.syncStore
+        .syncNow(result, status, syncInfo, jobStatus, store)
+        .then(async resultFromErpnext => {
+          if (resultFromErpnext) {
+            const data = resultFromErpnext.data;
+            const deleted = resultFromErpnext.deleted_documents;
+
+            for (let x = 0; x < data.length; x++) {
+              const table = data[x].tableNames;
+
+              if (table === "Categories") {
+                await categorySync(data[x], store);
+              } else if (table === "Customer") {
+                await customerSync(data[x], store);
+              } else if (table === "Discounts") {
+                await discountSync(data[x], store);
+              } else if (table === "Attendants") {
+                await attendantSync(data[x], store);
+              } else if (table === "Company") {
+                await companySync(data[x], store);
+              } else if (table === "Wallet") {
+                await walletSync(data[x], store);
+              }
+            }
+
+            if (deleted.length > 0) {
+              for (let x = 0; x < deleted.length; x++) {
+                await deleteRecords(deleted[x], store);
+              }
+            }
+          }
+
+          for (let xx = 0; xx < resultFromErpnext.data.length; xx += 1) {
+            if (resultFromErpnext.data[xx].tableNames === "Item") {
+              await itemSync(resultFromErpnext.data[xx], store);
+            }
+          }
+          await changeSyncStatusValue(result, store);
+          await category_lengths(store);
+          if (!jobStatus) {
+            setTimeout(() => {
+              Toast.show({
+                text: strings.SyncSuccessful + ". Please restart TailPOS",
+                duration: 30000,
+              });
+              store.stateStore.setIsNotSyncing();
+            }, 10000);
+          }
+
+          BackgroundJob.cancel({ jobKey: "AutomaticSync" });
         });
-      }
-
-      return { success: false, message: "Configuration incomplete" };
-    }
-
-    // NOUVEAU: Verifier la connexion reseau
-    const isOnline = await SyncService.checkNetworkStatus();
-    if (!isOnline) {
-      console.log("[syncInBackground] Pas de connexion internet");
-
-      if (!jobStatus) {
-        Toast.show({
-          text: strings.NoInternetConnection || "Pas de connexion Internet",
-          type: "danger",
-          duration: 3000,
-        });
-      }
-
-      // Essayer de traiter la queue offline quand meme
-      // (elle sera traitee quand la connexion reviendra)
-      return { success: false, message: "Pas de connexion" };
-    }
-
-    // Mettre a jour le statut dans le store
-    if (store && store.stateStore) {
-      store.stateStore.setIsSyncing();
-    }
-
-    if (store && store.syncStore) {
-      store.syncStore.setSyncStatus(SYNC_STATUS.SYNCING);
-    }
-
-    // NOUVEAU: Configurer l'API avec les credentials sauvegardes
-    FrappeAPI.setConfig(
-      ApiConfig.serverUrl,
-      ApiConfig.username,
-      ApiConfig._password // Note: Accede a la propriete privee pour la config
-    );
-
-    // NOUVEAU: Initialiser le service de synchronisation avec callbacks
-    await SyncService.initialize({
-      debugMode: ApiConfig.debugMode || false,
-      onProgressUpdate: (message, percentage) => {
-        console.log(`[syncInBackground] ${percentage}% - ${message}`);
-        if (store && store.syncStore) {
-          store.syncStore.setSyncProgress(percentage, message);
-        }
-      },
-      onSyncError: (error) => {
-        console.error("[syncInBackground] Erreur:", error);
-      },
-    });
-
-    // NOUVEAU: Lancer la synchronisation via SyncService
-    const result = await SyncService.syncAll();
-
-    console.log("[syncInBackground] Resultat:", result);
-
-    if (result.success) {
-      // Traiter les donnees recues
-      if (result.results) {
-        await processNewApiResults(result.results, store);
-      }
-
-      // Mettre a jour les statistiques
-      if (store && store.syncStore) {
-        store.syncStore.setSyncStatus(SYNC_STATUS.SUCCESS);
-        store.syncStore.setLastSyncTime(new Date());
-
-        if (result.results) {
-          store.syncStore.updateSyncStats(result.results);
-        }
-      }
-
-      // Recharger les compteurs
-      await category_lengths(store);
-
-      // Notification de succes
+    } else {
       if (!jobStatus) {
         setTimeout(() => {
           Toast.show({
-            text: strings.SyncSuccessful || "Synchronisation reussie",
-            type: "success",
+            text: strings.AlreadyUpToDate,
+            type: "danger",
             duration: 3000,
           });
-
-          if (store && store.stateStore) {
-            store.stateStore.setIsNotSyncing();
-          }
-        }, 1000);
-      }
-
-    } else {
-      // Echec de la synchronisation
-      if (store && store.syncStore) {
-        store.syncStore.setSyncStatus(SYNC_STATUS.ERROR);
-        store.syncStore.setSyncError(result.message);
-      }
-
-      if (!jobStatus) {
-        Toast.show({
-          text: result.message || strings.SyncFailed || "Echec de la synchronisation",
-          type: "danger",
-          duration: 5000,
-        });
-
-        if (store && store.stateStore) {
           store.stateStore.setIsNotSyncing();
-        }
+        }, 10000);
       }
+      BackgroundJob.cancel({ jobKey: "AutomaticSync" });
     }
-
-    // Annuler le job en arriere-plan apres completion
-    BackgroundJob.cancel({ jobKey: "AutomaticSync" });
-
-    return result;
-
-  } catch (error) {
-    console.error("[syncInBackground] Erreur:", error);
-
-    // Mettre a jour le statut d'erreur
-    if (store && store.syncStore) {
-      store.syncStore.setSyncStatus(SYNC_STATUS.ERROR);
-      store.syncStore.setSyncError(error.message);
-    }
-
-    if (store && store.stateStore) {
-      store.stateStore.setIsNotSyncing();
-    }
-
-    // Notification d'erreur
-    if (!jobStatus) {
-      Toast.show({
-        text: error.message || strings.SyncError || "Erreur de synchronisation",
-        type: "danger",
-        duration: 5000,
-      });
-    }
-
-    // Annuler le job
-    BackgroundJob.cancel({ jobKey: "AutomaticSync" });
-
-    throw error;
-  }
+  });
 }
-
-// ============================================================================
-// NOUVEAU: TRAITEMENT DES RESULTATS DE LA NOUVELLE API
-// ============================================================================
-
-/**
- * NOUVEAU: Traite les resultats de la nouvelle API
- * Cette fonction remplace le traitement individuel des anciennes reponses
- *
- * @param {Object} results - Resultats de SyncService.syncAll()
- * @param {Object} store - Reference au store MobX
- */
-async function processNewApiResults(results, store) {
-  console.log("[syncInBackground] Traitement des resultats API");
-
-  // Les donnees sont deja synchronisees par SyncService
-  // Cette fonction est pour les actions supplementaires si necessaires
-
-  // Mettre a jour les compteurs d'items si disponible
-  if (results.items && results.items.count > 0) {
-    console.log(`[syncInBackground] ${results.items.count} items synchronises`);
-  }
-
-  if (results.customers && results.customers.count > 0) {
-    console.log(`[syncInBackground] ${results.customers.count} clients synchronises`);
-  }
-
-  if (results.receipts && results.receipts.count > 0) {
-    console.log(`[syncInBackground] ${results.receipts.count} ventes envoyees`);
-  }
-
-  if (results.categories && results.categories.count > 0) {
-    console.log(`[syncInBackground] ${results.categories.count} categories synchronisees`);
-  }
-}
-
-// ============================================================================
-// FONCTIONS DE SYNCHRONISATION INDIVIDUELLES (CONSERVEES POUR COMPATIBILITE)
-// ============================================================================
-
-/**
- * Synchronise un item depuis les donnees ERPNext
- * CONSERVE pour compatibilite avec l'ancien format de donnees
- *
- * @param {Object} itemObject - Donnees de l'item
- * @param {Object} store - Reference au store
- */
 export async function itemSync(itemObject, store) {
   let itemObjectResult = await store.itemStore.find(itemObject.syncObject.id);
   let categoryId = "";
@@ -383,9 +236,6 @@ export async function itemSync(itemObject, store) {
   }
 }
 
-/**
- * Synchronise une categorie
- */
 export async function categorySync(categoryObject, store) {
   const { id, description, color, shape } = categoryObject.syncObject;
 
@@ -420,9 +270,6 @@ export async function categorySync(categoryObject, store) {
   });
 }
 
-/**
- * Synchronise une remise
- */
 export async function discountSync(discountObject, store) {
   let discountObjectResult = await store.discountStore.find(
     discountObject.syncObject.id,
@@ -472,9 +319,6 @@ export async function discountSync(discountObject, store) {
   }
 }
 
-/**
- * Synchronise un prepose/caissier
- */
 export async function attendantSync(attendantObject, store) {
   let attendantObjectResult = await store.attendantStore.find(
     attendantObject.syncObject.id,
@@ -521,9 +365,6 @@ export async function attendantSync(attendantObject, store) {
   }
 }
 
-/**
- * Synchronise un client
- */
 export async function customerSync(customerObject, store) {
   if (customerObject.syncObject.id !== null) {
     const customerObjectResult = await store.customerStore.find(
@@ -544,11 +385,11 @@ export async function customerSync(customerObject, store) {
         phoneNumber:
           customerObject.syncObject.phonenumber !== null
             ? customerObject.syncObject.phonenumber
-            : "",
+            : "Cashier",
         note:
           customerObject.syncObject.note !== null
             ? customerObject.syncObject.note
-            : "",
+            : "Cashier",
         dateUpdated: Date.now(),
         syncStatus: true,
       });
@@ -566,41 +407,37 @@ export async function customerSync(customerObject, store) {
         phoneNumber:
           customerObject.syncObject.phonenumber !== null
             ? customerObject.syncObject.phonenumber
-            : "",
+            : "Cashier",
         note:
           customerObject.syncObject.note !== null
             ? customerObject.syncObject.note
-            : "",
+            : "Cashier",
         dateUpdated: Date.now(),
         syncStatus: true,
       });
     }
   }
 }
-
-/**
- * Synchronise un portefeuille (wallet)
- */
 export async function walletSync(walletObject, store) {
-  if (walletObject.syncObject.id !== null && store.walletStore) {
+  if (walletObject.syncObject.id !== null) {
     const walletObjectResult = await store.walletStore.find(
       walletObject.syncObject.id,
     );
 
     if (walletObjectResult) {
       walletObjectResult.edit({
-        _id: walletObject.syncObject.id,
+        _id: walletObjectResult.syncObject.id,
         wallet_card_number:
-          walletObject.syncObject.wallet_card_number !== null
-            ? walletObject.syncObject.wallet_card_number
+          walletObjectResult.syncObject.wallet_card_number !== null
+            ? walletObjectResult.syncObject.wallet_card_number
             : "",
         prepaid_balance:
-          walletObject.syncObject.prepaid_balance !== null
-            ? walletObject.syncObject.prepaid_balance
+          walletObjectResult.syncObject.prepaid_balance !== null
+            ? walletObjectResult.syncObject.prepaid_balance
             : 0,
         credit_limit:
-          walletObject.syncObject.credit_limit !== null
-            ? walletObject.syncObject.credit_limit
+          walletObjectResult.syncObject.credit_limit !== null
+            ? walletObjectResult.syncObject.credit_limit
             : 0,
       });
     } else {
@@ -622,10 +459,6 @@ export async function walletSync(walletObject, store) {
     }
   }
 }
-
-/**
- * Synchronise les informations de la societe
- */
 export async function companySync(companyObject, store) {
   const companyObjectResult = await store.printerStore.findCompany(
     store.printerStore.companySettings[0]._id,
@@ -653,54 +486,43 @@ export async function companySync(companyObject, store) {
       tax: store.printerStore.companySettings[0].tax,
     });
 
-    // Mettre a jour le stateStore
-    if (store.stateStore) {
-      store.stateStore.changeValue(
-        "companyName",
-        store.printerStore.companySettings[0].name.toString(),
-        "Settings",
-      );
-      store.stateStore.changeValue(
-        "tax",
-        store.printerStore.companySettings[0].tax.toString(),
-        "Settings",
-      );
-      store.stateStore.changeValue(
-        "companyHeader",
-        store.printerStore.companySettings[0].header.toString(),
-        "Settings",
-      );
-      store.stateStore.changeValue(
-        "companyFooter",
-        store.printerStore.companySettings[0].footer.toString(),
-        "Settings",
-      );
-      store.stateStore.changeValue(
-        "companyLanguage",
-        store.printerStore.companySettings[0].companyLanguage.toString(),
-        "Settings",
-      );
-      store.stateStore.changeValue(
-        "oldLanguage",
-        store.printerStore.companySettings[0].companyLanguage.toString(),
-        "Settings",
-      );
-      store.stateStore.changeValue(
-        "companyCountry",
-        store.printerStore.companySettings[0].countryCode.toString(),
-        "Settings",
-      );
-    }
+    store.stateStore.changeValue(
+      "companyName",
+      store.printerStore.companySettings[0].name.toString(),
+      "Settings",
+    );
+    store.stateStore.changeValue(
+      "tax",
+      store.printerStore.companySettings[0].tax.toString(),
+      "Settings",
+    );
+    store.stateStore.changeValue(
+      "companyHeader",
+      store.printerStore.companySettings[0].header.toString(),
+      "Settings",
+    );
+    store.stateStore.changeValue(
+      "companyFooter",
+      store.printerStore.companySettings[0].footer.toString(),
+      "Settings",
+    );
+    store.stateStore.changeValue(
+      "companyLanguage",
+      store.printerStore.companySettings[0].companyLanguage.toString(),
+      "Settings",
+    );
+    store.stateStore.changeValue(
+      "oldLanguage",
+      store.printerStore.companySettings[0].companyLanguage.toString(),
+      "Settings",
+    );
+    store.stateStore.changeValue(
+      "companyCountry",
+      store.printerStore.companySettings[0].countryCode.toString(),
+      "Settings",
+    );
   }
 }
-
-// ============================================================================
-// FONCTIONS DE MISE A JOUR DE STATUT
-// ============================================================================
-
-/**
- * Met a jour le statut de synchronisation des objets
- */
 export async function changeSyncStatusValue(data, store) {
   let dataValue = JSON.parse(data);
   if (dataValue.length > 0) {
@@ -728,9 +550,6 @@ export async function changeSyncStatusValue(data, store) {
   }
 }
 
-/**
- * Change la valeur de syncStatus d'un objet
- */
 export async function changeValue(changeObject, store, dbType) {
   if (changeObject) {
     let objectToBeEdit = "";
@@ -757,9 +576,6 @@ export async function changeValue(changeObject, store, dbType) {
   }
 }
 
-/**
- * Supprime les enregistrements marques comme supprimes
- */
 export async function deleteRecords(deletedObject, store) {
   if (deletedObject) {
     if (deletedObject._id !== null) {
@@ -786,75 +602,6 @@ export async function deleteRecords(deletedObject, store) {
     }
   }
 }
-
-/**
- * Recharge les compteurs de categories
- */
 export async function category_lengths(props) {
-  if (props && props.itemStore) {
-    await props.itemStore.getLengthItemsFromDb();
-  }
-}
-
-// ============================================================================
-// NOUVELLES FONCTIONS UTILITAIRES (Phase 3)
-// ============================================================================
-
-/**
- * NOUVEAU: Lance une synchronisation rapide (items et clients seulement)
- * @param {Object} store - Reference au store MobX
- * @returns {Promise<Object>} Resultat
- */
-export async function quickSync(store) {
-  console.log("[syncInBackground] Quick sync");
-
-  try {
-    await SyncService.initialize({ debugMode: false });
-
-    const itemsResult = await SyncService.syncItems();
-    const customersResult = await SyncService.syncCustomers();
-
-    return {
-      success: itemsResult.success && customersResult.success,
-      items: itemsResult,
-      customers: customersResult,
-    };
-
-  } catch (error) {
-    console.error("[syncInBackground] Erreur quick sync:", error);
-    throw error;
-  }
-}
-
-/**
- * NOUVEAU: Envoie uniquement les ventes en attente
- * @param {Object} store - Reference au store MobX
- * @returns {Promise<Object>} Resultat
- */
-export async function pushReceipts(store) {
-  console.log("[syncInBackground] Push receipts");
-
-  try {
-    await SyncService.initialize({ debugMode: false });
-    return await SyncService.syncReceipts();
-
-  } catch (error) {
-    console.error("[syncInBackground] Erreur push receipts:", error);
-    throw error;
-  }
-}
-
-/**
- * NOUVEAU: Verifie et traite la queue offline
- * @returns {Promise<Object>} Resultat
- */
-export async function processOfflineQueue() {
-  console.log("[syncInBackground] Processing offline queue");
-
-  try {
-    return await SyncService.processOfflineQueue();
-  } catch (error) {
-    console.error("[syncInBackground] Erreur offline queue:", error);
-    throw error;
-  }
+  await props.itemStore.getLengthItemsFromDb();
 }
